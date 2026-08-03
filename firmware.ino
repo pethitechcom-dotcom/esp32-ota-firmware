@@ -3,13 +3,13 @@
 #include <HTTPUpdate.h>
 #include <WebServer.h>
 #include <DNSServer.h>
-#include <WiFiManager.h>      // Thư viện quản lý cấu hình WiFi qua Web
+#include <WiFiManager.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <AccelStepper.h>
 
 // ================= CẤU HÌNH FIRMWARE & OTA =================
-const String CURRENT_VERSION = "2.1";  
+const String CURRENT_VERSION = "2.2";  
 const String URL_VERSION  = "https://raw.githubusercontent.com/pethitechcom-dotcom/esp32-ota-firmware/main/version.txt";
 const String URL_FIRMWARE = "https://raw.githubusercontent.com/pethitechcom-dotcom/esp32-ota-firmware/main/firmware.ino.bin";
 
@@ -20,13 +20,13 @@ const String URL_FIRMWARE = "https://raw.githubusercontent.com/pethitechcom-dotc
 #define BTN_START       3   // Nút bấm chạy máy/tạm dừng
 #define BTN_HOME        4   // Nút bấm đưa về Home
 #define BTN_ESTOP       5   // Nút dừng khẩn cấp (Ngắt cứng)
-#define SENSOR_HOME     6   // Cảm biến tiệm cận gốc Home
-#define SENSOR_END      7   // Cảm biến tiệm cận giới hạn cuối
+#define SENSOR_HOME     6   // Cảm biến tiệm cận gốc Home (NPN)
+#define SENSOR_END      7   // Cảm biến tiệm cận giới hạn cuối (NPN)
 
 #define STEP_PUL        17  // Chân xung Step
 #define STEP_DIR        16  // Chân chiều DIR
 #define STEP_ENA        18  // Chân cho phép ENA
-#define RELAY_CUTTER    34  // Rơ-le Contactor máy cắt
+#define RELAY_CUTTER    34  // Rơ-le Contactor máy cắt (GPIO34)
 
 // ================= HẰNG SỐ HIỆU CHUẨN BIẾN TRỞ =================
 #define POT_RAW_MIN     100
@@ -72,7 +72,7 @@ int readings[numReadings];
 int readIndex = 0;              
 long total = 0;                 
 
-// Khai báo hàm phụ trợ OTA
+// Khai báo hàm phụ trợ
 void checkAndPerformOTA();
 void triggerBeep(unsigned long duration);
 void handleBuzzer();
@@ -80,7 +80,17 @@ void controlLED();
 void readPotentiometer();
 void displayStatus();
 
-// ================= HÀM NGẮT KHẨN CẤP =================
+// ================= NGẮT PHẦN CỨNG BƠM XUNG ĐỘNG CƠ (TIMER) =================
+hw_timer_t * timer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+
+void IRAM_ATTR onTimer() {
+  portENTER_CRITICAL_ISR(&timerMux);
+  stepper.runSpeed(); // Tự động phát xung ngầm không cần CPU chờ
+  portEXIT_CRITICAL_ISR(&timerMux);
+}
+
+// ================= HÀM NGẮT KHẨN CẤP (E-STOP) =================
 void IRAM_ATTR eStopISR() {
   eStopTriggered = true;
 }
@@ -90,6 +100,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  // Cấu hình ngõ vào có trở kéo lên (INPUT_PULLUP)
   pinMode(BTN_START, INPUT_PULLUP);
   pinMode(BTN_HOME, INPUT_PULLUP);
   pinMode(BTN_ESTOP, INPUT_PULLUP);
@@ -104,18 +115,23 @@ void setup() {
   digitalWrite(BUZZER_PIN, LOW);   // 0 = Tắt còi
   digitalWrite(RELAY_CUTTER, LOW); // Tắt rơ-le
 
+  // Cài đặt ngắt E-Stop
   attachInterrupt(digitalPinToInterrupt(BTN_ESTOP), eStopISR, FALLING);
 
+  // Bộ lọc biến trở
   analogReadResolution(12);
   for (int i = 0; i < numReadings; i++) readings[i] = 0;
 
+  // Cấu hình Stepper (Không set tốc độ ở đây, để Timer lo)
   stepper.setEnablePin(STEP_ENA);
   stepper.setPinsInverted(false, false, true); 
   stepper.setMaxSpeed(4000); 
   stepper.setAcceleration(2500);
   stepper.enableOutputs();
 
+  // Khởi động I2C ép xung 400kHz để màn hình in cực nhanh
   Wire.begin(8, 9);
+  Wire.setClock(400000); 
   Wire.setTimeOut(100); 
   
   lcd.init();
@@ -125,7 +141,7 @@ void setup() {
   lcd.setCursor(0, 2); lcd.print(" VUI LONG CHO...    ");
   lcd.setCursor(0, 3); lcd.print("====================");
 
-  // 1. Khởi tạo WiFiManager kết nối mạng
+  // Khởi tạo WiFiManager kết nối mạng
   WiFiManager wm;
   if (!wm.autoConnect("ESP32-S2-Setup")) {
     Serial.println("Cấu hình WiFi thất bại. Khởi động lại...");
@@ -138,16 +154,23 @@ void setup() {
   triggerBeep(100); delay(150);
   delay(1000);
 
-  // 2. Kiểm tra cập nhật OTA ngay khi khởi động thành công
+  // Kiểm tra OTA lần đầu
   lcd.setCursor(0, 1); lcd.print(" KIEM TRA CAP NHAT  ");
   checkAndPerformOTA();
 
   lcd.clear();
+
+  // Khởi động Hardware Timer cho động cơ (Dành cho core v2)
+  // (Nếu dùng core v3 báo lỗi, đổi thành: timer = timerBegin(1000000); timerAttachInterrupt(timer, &onTimer);)
+  timer = timerBegin(0, 80, true);               
+  timerAttachInterrupt(timer, &onTimer, true);   
+  timerAlarmWrite(timer, 50, true);              // Chu kỳ 50us = Tần số 20kHz phát xung
+  timerAlarmEnable(timer);                       
 }
 
 // ================= VÒNG LẶP CHÍNH =================
 void loop() {
-  // Kiểm tra cập nhật OTA định kỳ mỗi 5 phút (300000 ms)
+  // 1. Kiểm tra OTA nền định kỳ 5 phút
   static unsigned long lastOtaCheck = 0;
   if (millis() - lastOtaCheck > 300000) {
     lastOtaCheck = millis();
@@ -156,26 +179,37 @@ void loop() {
     }
   }
 
-  // 1. XỬ LÝ KHẨN CẤP
+  // 2. XỬ LÝ KHẨN CẤP AN TOÀN TUYỆT ĐỐI
   if (eStopTriggered) {
-    if (currentState != STATE_ESTOP) {
-      currentState = STATE_ESTOP;
-      digitalWrite(RELAY_CUTTER, LOW); 
-      stepper.stop();
-      stepper.disableOutputs();        
+    if (digitalRead(BTN_ESTOP) == LOW) {
+      // Đang bị nhấn: Khóa chết hệ thống
+      if (currentState != STATE_ESTOP) {
+        currentState = STATE_ESTOP;
+        digitalWrite(RELAY_CUTTER, LOW); 
+        stepper.stop();
+        stepper.disableOutputs();        
+        displayStatus();                 
+      }
+      handleBuzzer(); 
+      controlLED(); 
+      return; // Chặn CPU không chạy tiếp
+    } 
+    else {
+      // Đã nhả nút: Reset và mở khóa
+      eStopTriggered = false;          
+      currentState = STATE_IDLE;       
+      stepper.enableOutputs();         
+      digitalWrite(BUZZER_PIN, LOW);   
       displayStatus();                 
     }
-    handleBuzzer(); 
-    controlLED(); // Ép LED cập nhật trạng thái lỗi
-    return; 
   }
 
-  // 2. ĐỌC BIẾN TRỞ & ĐIỀU KHIỂN ĐÈN/CÒI
+  // 3. ĐỌC BIẾN TRỞ & NGOẠI VI NỀN
   readPotentiometer();
   handleBuzzer();
-  controlLED(); // LED nhấp nháy chạy hoàn toàn độc lập dưới nền
+  controlLED(); 
 
-  // 3. ĐỌC NÚT NHẤN KHÔNG CHẶN CPU
+  // 4. ĐỌC NÚT NHẤN (NON-BLOCKING)
   bool currentStart = (digitalRead(BTN_START) == LOW);
   bool currentHome  = (digitalRead(BTN_HOME) == LOW);
   bool triggerStart = false;
@@ -199,11 +233,12 @@ void loop() {
     homeBtnState = false;
   }
 
-  // 4. MÁY TRẠNG THÁI
+  // 5. MÁY TRẠNG THÁI HỆ THỐNG
   switch (currentState) {
     
     case STATE_IDLE:
       digitalWrite(RELAY_CUTTER, LOW); 
+      stepper.setSpeed(0); // Dừng động cơ
       if (triggerStart) { 
         currentState = STATE_DELAY_START;
         digitalWrite(RELAY_CUTTER, HIGH); 
@@ -222,8 +257,7 @@ void loop() {
       break;
 
     case STATE_CUTTING:
-      stepper.setSpeed(currentSpeed);
-      stepper.runSpeed(); 
+      stepper.setSpeed(currentSpeed); // Cập nhật tốc độ mới liên tục, Timer sẽ lo việc phát xung
 
       if (digitalRead(SENSOR_END) == LOW) {
         currentState = STATE_END_LIMIT;
@@ -232,7 +266,7 @@ void loop() {
         triggerBeep(600); 
       }
 
-      if (triggerStart) {
+      if (triggerStart) { // Ấn lần 2 để tạm dừng
         currentState = STATE_IDLE;
         digitalWrite(RELAY_CUTTER, LOW);
         stepper.stop();
@@ -240,6 +274,7 @@ void loop() {
       break;
 
     case STATE_END_LIMIT:
+      stepper.setSpeed(0);
       if (triggerHome) {
         currentState = STATE_HOMING;
         stepper.setSpeed(-1200); 
@@ -247,8 +282,6 @@ void loop() {
       break;
 
     case STATE_HOMING:
-      stepper.runSpeed();
-
       if (digitalRead(SENSOR_HOME) == LOW) {
         stepper.stop();
         stepper.setCurrentPosition(0); 
@@ -261,70 +294,35 @@ void loop() {
       break;
   }
 
-  // 5. CẬP NHẬT MÀN HÌNH LCD
+  // 6. CẬP NHẬT MÀN HÌNH LCD
   if (millis() - lastLcdUpdate > 300) {
     displayStatus();
     lastLcdUpdate = millis();
   }
 }
 
-// ================= CÁC HÀM XỬ LÝ PHỤ TRỢ & OTA =================
+// ================= CÁC HÀM XỬ LÝ CHỨC NĂNG =================
 
 void checkAndPerformOTA() {
-  Serial.println("Đang kiểm tra phiên bản mới từ GitHub...");
-
   WiFiClientSecure client;
-  client.setInsecure(); // Bỏ qua xác thực SSL để kết nối raw.githubusercontent.com mượt mà
+  client.setInsecure(); 
 
   HTTPClient http;
   if (http.begin(client, URL_VERSION)) {
     int httpCode = http.GET();
     if (httpCode == HTTP_CODE_OK) {
       String payload = http.getString();
-      payload.trim(); // Xóa khoảng trắng thừa hoặc ký tự xuống dòng
+      payload.trim(); 
       
-      Serial.print("Phiên bản trên GitHub: v");
-      Serial.println(payload);
-
       if (payload != CURRENT_VERSION) {  
-        Serial.println("Phát hiện phiên bản mới! Bắt đầu tải Firmware...");
-        
         lcd.setCursor(0, 2); lcd.print(" DANG TAI PHIEN BAN  ");
-        lcd.setCursor(0, 3); lcd.print(" MOI TU GITHUB...     ");
+        lcd.setCursor(0, 3); lcd.print(" MOI TU GITHUB...    ");
 
-        // Cấu hình sự kiện cập nhật
-        httpUpdate.onStart([]() {
-          Serial.println("OTA: Bắt đầu tải firmware mới...");
-        });
-        httpUpdate.onEnd([]() {
-          Serial.println("OTA: Tải xong! Đang nạp vào flash...");
-        });
-        httpUpdate.onProgress([](int cur, int total) {
-          Serial.printf("OTA: Tiến độ: %d%%\r", (cur * 100) / total);
-        });
-        
-        t_httpUpdate_return ret = httpUpdate.update(client, URL_FIRMWARE);
-
-        switch (ret) {
-          case HTTP_UPDATE_FAILED:
-            Serial.printf("Cập nhật thất bại. Lỗi (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-            break;
-          case HTTP_UPDATE_NO_UPDATES:
-            Serial.println("Không có bản cập nhật.");
-            break;
-          case HTTP_UPDATE_OK:
-            Serial.println("Cập nhật thành công! Mạch đang tự khởi động lại...");
-            break;
-        }
-      } else {
-        Serial.println("Mạch đang dùng phiên bản mới nhất.");
+        httpUpdate.update(client, URL_FIRMWARE);
+        // Nếu thành công máy tự reset, không cần lệnh xử lý thêm
       }
-    } else {
-      Serial.printf("Không thể đọc file version.txt. Mã lỗi HTTP: %d\n", httpCode);
     }
     http.end();
-  } else {
-    Serial.println("Không thể kết nối tới máy chủ GitHub.");
   }
 }
 
@@ -333,10 +331,10 @@ void controlLED() {
   static bool ledState = false;
 
   if (currentState == STATE_IDLE) {
-    digitalWrite(LED_PIN, LOW); // 0 = Sáng liên tục chờ lệnh
+    digitalWrite(LED_PIN, LOW); 
   } 
   else if (currentState == STATE_ESTOP) {
-    digitalWrite(LED_PIN, HIGH); // 1 = Tắt ngóm khi lỗi
+    digitalWrite(LED_PIN, HIGH); 
   } 
   else {
     if (millis() - lastLedToggle > 250) {
